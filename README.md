@@ -1,96 +1,92 @@
-# Unified ANPR + Snow Service (RU)
+# Snow/Plate Wrapper (RU)
 
-Сервис объединяет события двух камер: номерной (Hikvision ANPR) и снеговой (RTSP). Поток такой: снеговая камера кладёт кадры в память, при приходе ANPR вебхука ищется предыдущее снеговое событие в окне, вызывается Gemini для оценки заполненности кузова и отправляется единый multipart на внешний сервис.
+Сервис принимает две RTSP-камеры (номерная и снеговая), отслеживает пересечение заданных линий, берёт по одному кадру с каждой камеры, отправляет их в Gemini (процент снега + номер), после чего шлёт multipart/form-data на внешний backend (`UPSTREAM_URL`).
 
-## Архитектура и потоки
-- `api.py` (FastAPI): эндпоинты `GET /health`, `POST /anpr`, `POST /api/v1/anpr/hikvision`. Загружает модели ANPR, по старту может включить снежный воркер.
-- `snow_worker.py`: фон, читает RTSP, детектит грузовики (YOLO), при движении в зоне сохраняет кадр в памяти и кладёт в очередь мерджера (без диска, без Gemini).
-- `combined_merger.py`: хранит снеговые события в памяти (TTL + окно), при ANPR событии берёт ближайшее предыдущее снеговое, только тогда вызывает Gemini (если есть ключ) и шлёт единый multipart на `UPSTREAM_URL`.
-- `modules/anpr.py`: детектор номера (YOLO) + OCR (PaddleOCR) + нормализация KZ шаблонов.
+## Поток обработки
+- `stream_processor.py` (запускается вместе с FastAPI `api.py`):
+  1) Читает `PLATE_CAMERA_RTSP` и `SNOW_CAMERA_RTSP` через FFmpeg.
+  2) YOLOv8 (`yolov8n.pt`) детектит грузовики (car/truck) на каждом кадре (`STREAM_DETECTION_INTERVAL`).
+  3) Детектор пересечения наклонной линии (нормированные точки `*_LINE_X1/Y1/X2/Y2`, направление `*_LINE_DIRECTION`) срабатывает отдельно для plate и snow потоков.
+  4) При пересечении сохраняются кадры (в память), вызывается Gemini с двумя фото: `snow_snapshot` + `plate_snapshot`.
+  5) Формируется `event` и отправляется на `UPSTREAM_URL` как multipart (`event` JSON строкой + файлы `photos`).
+- `api.py` — FastAPI (эндпоинты `/health`, вспомогательные), поднимает `stream_processor` при `ENABLE_STREAM_PROCESSOR=true`.
 
-### Логика снег → номер
-1) Воркер видит грузовик в центральной зоне, движение слева направо → кодирует кадр в JPEG, кладёт в очередь с `event_time`/`bbox` (без Gemini).
-2) При ANPR вебхуке мерджер ищет предыдущее снеговое в окне `MERGE_WINDOW_SECONDS` (snow раньше, plate позже). Просроченные (`MERGE_TTL_SECONDS`) удаляются.
-3) Если найдено: вызывает Gemini по `snowSnapshot` (обрезает по bbox), заполняет `snow_volume_percentage/confidence`, прикладывает `snowSnapshot.jpg`, `matched_snow=true`.
-4) Если не найдено или нет ключа Gemini: ставит нули, `matched_snow` остаётся по факту наличия матча; снимок снега прикладывается только при матче.
-5) События без валидного номера/уверенности пропускаются.
+## Что отправляем на backend (multipart/form-data)
+- Поле `event` (JSON строкой):
+  - `camera_id` (`PLATE_CAMERA_ID`)
+  - `event_time` — локальное время с `LOCAL_TZ_OFFSET_HOURS` (ISO 8601)
+  - `plate` — номер из Gemini; если не распознан, строка `"None"`
+  - `confidence` — `plate_confidence` из Gemini (0 если нет номера)
+  - `direction`, `lane`, `vehicle` (пустой объект)
+  - `snow_volume_percentage`, `snow_volume_confidence` — из Gemini (0 если не было оценки)
+  - `matched_snow` — true/false
+  - `gemini_result` — сырой ответ Gemini (для отладки)
+- Поле `photos` (может быть несколько):
+  - `detectionPicture.jpg` — кадр с номерной камеры
+  - `snowSnapshot.jpg` — кадр со снеговой камеры
+  - (Если есть другие кропы — также под ключом `photos`)
 
-### Логика ANPR вебхука
-- Путь 1 (multipart Hikvision): парсит `anpr.xml` (номер/время/уверенность), кадр `detectionPicture.jpg` прогоняется через свою модель. Если нет валидного номера/уверенности — пропуск. Если модель/камера не вернули номер, подставляется хардкод `747AO`, иначе отправляется реальный.
-- Путь 2 (fallback JPEG в body): только модель ANPR. Аналогично: при отсутствии валидного номера/уверенности — пропуск; хардкод ставится только если модель не дала номер.
-- Все события/пропуски пишутся в `hik_raws/detections.log`.
-
-## Переменные окружения (`.env` пример)
+## Ключевые переменные окружения (`app.env`)
 ```
-UPSTREAM_URL=https://snowops-anpr-service.onrender.com/api/v1/anpr/events
-PLATE_CAMERA_ID=camera-001
+UPSTREAM_URL=...
+PLATE_CAMERA_ID=shahovskoye
 
-# merge timing
-MERGE_WINDOW_SECONDS=30
-MERGE_TTL_SECONDS=60
+PLATE_CAMERA_RTSP=rtsp://...
+SNOW_CAMERA_RTSP=rtsp://...
 
-# snow worker
-ENABLE_SNOW_WORKER=true
-SNOW_VIDEO_SOURCE_URL=rtsp://user:pass@host:port/Streaming/Channels/101
-SNOW_CAMERA_ID=camera-snow
-SNOW_YOLO_MODEL_PATH=yolov8n.pt
-SNOW_CENTER_ZONE_START_X=0.15
-SNOW_CENTER_ZONE_END_X=0.85
-SNOW_CENTER_ZONE_START_Y=0.0
-SNOW_CENTER_ZONE_END_Y=1.0
-SNOW_CENTER_LINE_X=0.5
-SNOW_MIN_DIRECTION_DELTA=5
-SNOW_STATIONARY_TIMEOUT_SECONDS=10.0
-SNOW_SHOW_WINDOW=false
+# Линии (нормированные координаты 0..1, можно под углом)
+PLATE_LINE_X1=0.000
+PLATE_LINE_Y1=0.845
+PLATE_LINE_X2=1.000
+PLATE_LINE_Y2=0.600
+PLATE_LINE_DIRECTION=down   # up/down/left/right/any
 
-# merge timing (для фильтрации старых событий)
-MERGE_MAX_EVENT_AGE_SECONDS=15.0
+SNOW_LINE_X1=0.000
+SNOW_LINE_Y1=0.875
+SNOW_LINE_X2=1.000
+SNOW_LINE_Y2=0.600
+SNOW_LINE_DIRECTION=down
 
-# Gemini (нужен только при мердже со снегом)
-GEMINI_API_KEY=your_key
+# Детект и трекинг
+STREAM_DETECTION_INTERVAL=1
+STREAM_MIN_CONFIDENCE=0.28
+STREAM_MIN_BBOX_AREA=3000
+TRACK_MIN_HITS=1
+TRACK_IOU_THRESHOLD=0.25
+
+FFMPEG_OUT_W=1920
+FFMPEG_OUT_H=1080
+USE_FFMPEG_DIRECT=true
+FFMPEG_BIN=.../ffmpeg.exe
+
+GEMINI_API_KEY=...
 GEMINI_MODEL=gemini-2.5-flash
+LOCAL_TZ_OFFSET_HOURS=5    # Астана = +5
+
+ENABLE_STREAM_PROCESSOR=true
 ```
 
 ## Запуск
 ```bash
 python -m venv .venv
-.\.venv\Scripts\activate   # или source .venv/bin/activate
-pip install --upgrade pip
+.\.venv\Scripts\activate
 pip install -r requirements.txt
 
-uvicorn api:app --host 0.0.0.0 --port 8000 --env-file .env
+python -m uvicorn api:app --host 0.0.0.0 --port 8000
 ```
-Если `ENABLE_SNOW_WORKER=true`, воркер стартует вместе с приложением. Остановка — Ctrl+C.
+Логи в консоли: `Plate crossing ...`, `Snow crossing ...`, `Gemini result ...`, `Upstream: status=...`.
 
-## Эндпоинты
-- `GET /health` → `{"status": "ok"}`
-- `POST /anpr` → `multipart/form-data` с полем `file` (JPEG/PNG), отдаёт JSON с номером.
-- `POST /api/v1/anpr/hikvision` → вебхук Hikvision (multipart с `anpr.xml` + изображениями или raw JPEG fallback). Триггерит ANPR и мердж со снегом.
+## Линии и предпросмотр
+- `preview_lines.py` — показывает две камеры (plate сверху, snow снизу), позволяет двигать наклонные линии:
+  - `1/2` выбор линии, `TAB/C` выбор точки A/B, `WASD` мелкий шаг, `IJKL` крупный, `R` перечитать `app.env`.
+  - После закрытия выводит координаты для `app.env`.
 
-## Что уходит во внешний сервис (multipart на `UPSTREAM_URL`)
-- Поле `event` (строка JSON). Ключи:
-  - `camera_id` (`PLATE_CAMERA_ID`)
-  - `event_time` (из XML или сейчас, RFC3339)
-  - `plate`, `confidence`
-  - `camera_plate`, `camera_confidence` (из XML, если были)
-  - `model_plate`, `model_det_conf`, `model_ocr_conf`
-  - `direction`, `lane`, `vehicle` (заглушка `{}`)
-  - `timestamp` (время обработки)
-  - `original_plate_test` (оригинальный номер до возможного хардкода, для отладки)
-  - `matched_snow` (true/false)
-  - При матче со снегом: `snow_volume_percentage`, `snow_volume_confidence`, `snow_gemini_raw`
-  - При отсутствии матча: `snow_volume_percentage=0`, `snow_volume_confidence=0`, `matched_snow=false`
-- Поле `photos` (несколько файлов):
-  - `detectionPicture.jpg` — кадр ANPR (всегда при multipart Hikvision, при fallback — выдранный JPEG)
-  - `featurePicture.jpg` — если пришла
-  - `licensePlatePicture.jpg` — если пришла
-  - `snowSnapshot.jpg` — если было совпавшее снеговое событие
+## Логи/ошибки
+- В консоли: crossing, Gemini, отправка на backend.
+- Если номер не распознан — в `plate` отправляется строка `"None"` (backend не примет, вернёт 400; видно в логах).
+- 403 от backend означает, что номер не в whitelist (на стороне backend).
 
-## Данные и логи
-- Логи вебхуков ANPR: `hik_raws/detections.log`
-- Снимки снега на диск не пишутся (всё в памяти).
-
-## Важные нюансы
-- Очередь снега чистится по TTL при добавлении/мердже; при полном простое старые элементы останутся в памяти до следующего события.
-- При отсутствии `GEMINI_API_KEY` снеговая часть ставится в нули, но при матче `matched_snow` остаётся true и `snowSnapshot.jpg` уходит.
-- В `.env` нельзя хранить реальные ключи/RTSP в репозитории.
+## Что принимать на стороне backend
+- Ожидайте multipart/form-data:
+  - `event` — JSON строкой (см. ключи выше).
+  - `photos` — одно или несколько файлов (JPEG). Имена файлов типовые: `detectionPicture.jpg`, `snowSnapshot.jpg` (но полагайтесь на ключ `photos`, не на имя).

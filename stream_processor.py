@@ -7,7 +7,7 @@ import time
 import subprocess
 import shutil
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from collections import deque
 from typing import Optional, Tuple, Dict, Any, Deque, Union
 
@@ -62,6 +62,42 @@ def _get_env_str(key: str, fallback_key: str | None = None, default: str = "down
     return str(v).strip().lower()
 
 
+def _get_line_from_env(prefix: str, default_y: float) -> tuple[float, float, float, float, str]:
+    """
+    Возвращает (x1, y1, x2, y2, direction) в нормированных координатах [0..1].
+    Поддерживает старый формат *_LINE_Y_POSITION как горизонтальную линию.
+    """
+    dir_val = _get_env_str(f"{prefix}_LINE_DIRECTION", "LINE_DIRECTION", "down")
+
+    y_only = os.getenv(f"{prefix}_LINE_Y_POSITION")
+    if y_only:
+        y = float(y_only)
+        return 0.0, y, 1.0, y, dir_val
+
+    def _float_env(k: str, default: float) -> float:
+        try:
+            return float(os.getenv(k, f"{default:.3f}"))
+        except ValueError:
+            return default
+
+    x1 = _float_env(f"{prefix}_LINE_X1", 0.0)
+    y1 = _float_env(f"{prefix}_LINE_Y1", default_y)
+    x2 = _float_env(f"{prefix}_LINE_X2", 1.0)
+    y2 = _float_env(f"{prefix}_LINE_Y2", default_y)
+    return x1, y1, x2, y2, dir_val
+
+
+def _now_local_iso() -> str:
+    """
+    Возвращает текущее время с учётом LOCAL_TZ_OFFSET_HOURS в ISO 8601.
+    Пример: offset=5 -> 2025-01-21T12:34:56+05:00
+    """
+    offset_hours = float(os.getenv("LOCAL_TZ_OFFSET_HOURS", "0"))
+    offset = timedelta(hours=offset_hours)
+    tz = timezone(offset)
+    return datetime.now(tz=tz).isoformat()
+
+
 # =========================
 # 1) Settings
 # =========================
@@ -69,11 +105,8 @@ def _get_env_str(key: str, fallback_key: str | None = None, default: str = "down
 PLATE_CAMERA_RTSP = os.getenv("PLATE_CAMERA_RTSP", "rtsp://USER:PASSWORD@HOST:554/Streaming/Channels/101")
 SNOW_CAMERA_RTSP  = os.getenv("SNOW_CAMERA_RTSP",  "rtsp://USER:PASSWORD@HOST:554/Streaming/Channels/101")
 
-PLATE_LINE_Y_POSITION = _get_env_float("PLATE_LINE_Y_POSITION", "LINE_Y_POSITION", 0.6)
-PLATE_LINE_DIRECTION  = _get_env_str("PLATE_LINE_DIRECTION", "LINE_DIRECTION", "down")
-
-SNOW_LINE_Y_POSITION  = _get_env_float("SNOW_LINE_Y_POSITION", "LINE_Y_POSITION", 0.6)
-SNOW_LINE_DIRECTION   = _get_env_str("SNOW_LINE_DIRECTION", "LINE_DIRECTION", "down")
+PLATE_LINE_X1, PLATE_LINE_Y1, PLATE_LINE_X2, PLATE_LINE_Y2, PLATE_LINE_DIRECTION = _get_line_from_env("PLATE", 0.6)
+SNOW_LINE_X1,  SNOW_LINE_Y1,  SNOW_LINE_X2,  SNOW_LINE_Y2,  SNOW_LINE_DIRECTION  = _get_line_from_env("SNOW", 0.6)
 
 MIN_CONFIDENCE = float(os.getenv("STREAM_MIN_CONFIDENCE", "0.5"))
 MIN_BBOX_AREA  = int(os.getenv("STREAM_MIN_BBOX_AREA", "10000"))
@@ -100,8 +133,8 @@ USE_FFMPEG_DIRECT = os.getenv("USE_FFMPEG_DIRECT", "false").strip().lower() == "
 
 FFMPEG_BIN_ENV = os.getenv("FFMPEG_BIN", "").strip()
 
-print(f"[STREAM] Plate camera line: Y={PLATE_LINE_Y_POSITION}, direction={PLATE_LINE_DIRECTION}")
-print(f"[STREAM] Snow camera line:  Y={SNOW_LINE_Y_POSITION}, direction={SNOW_LINE_DIRECTION}")
+print(f"[STREAM] Plate camera line: ({PLATE_LINE_X1:.3f},{PLATE_LINE_Y1:.3f})-({PLATE_LINE_X2:.3f},{PLATE_LINE_Y2:.3f}), dir={PLATE_LINE_DIRECTION}")
+print(f"[STREAM] Snow camera line:  ({SNOW_LINE_X1:.3f},{SNOW_LINE_Y1:.3f})-({SNOW_LINE_X2:.3f},{SNOW_LINE_Y2:.3f}), dir={SNOW_LINE_DIRECTION}")
 print(f"[STREAM] USE_FFMPEG_DIRECT={USE_FFMPEG_DIRECT}, FFMPEG_OUT={FFMPEG_OUT_W}x{FFMPEG_OUT_H}")
 
 
@@ -151,9 +184,16 @@ class TimestampedFrame:
 # =========================
 
 class LineCrossingDetector:
-    """Простой IOU-трекер + детектор пересечения горизонтальной линии по центру bbox."""
-    def __init__(self, line_y_ratio: float, direction: str = "down"):
-        self.line_y_ratio = float(line_y_ratio)
+    """
+    Простой IOU-трекер + детектор пересечения наклонной линии по центру bbox.
+    Линия задаётся двумя точками (нормированные координаты 0..1). Направление:
+    down/up/left/right/any — проверяется по вектору движения центра bbox.
+    """
+    def __init__(self, x1r: float, y1r: float, x2r: float, y2r: float, direction: str = "down"):
+        self.line_x1 = float(x1r)
+        self.line_y1 = float(y1r)
+        self.line_x2 = float(x2r)
+        self.line_y2 = float(y2r)
         self.direction = direction.strip().lower()
         self.tracks: Dict[int, Track] = {}
         self.next_track_id = 1
@@ -183,7 +223,16 @@ class LineCrossingDetector:
             return []
 
         now_ts = time.time()
-        line_y = int(h * self.line_y_ratio)
+        x1 = int(w * self.line_x1)
+        y1 = int(h * self.line_y1)
+        x2 = int(w * self.line_x2)
+        y2 = int(h * self.line_y2)
+
+        lx = x2 - x1
+        ly = y2 - y1
+        seg_len_sq = lx * lx + ly * ly
+        if seg_len_sq < 1:
+            return []
 
         # состариваем
         for tr in self.tracks.values():
@@ -198,10 +247,10 @@ class LineCrossingDetector:
             best_iou = 0.0
             best_det_idx: Optional[int] = None
 
-            for det_idx, (x1, y1, x2, y2, conf) in enumerate(detections):
+            for det_idx, (x1_det, y1_det, x2_det, y2_det, conf) in enumerate(detections):
                 if det_idx in matched_dets:
                     continue
-                iou = self._iou(tr.bbox, (x1, y1, x2, y2))
+                iou = self._iou(tr.bbox, (x1_det, y1_det, x2_det, y2_det))
                 if iou > best_iou and iou >= TRACK_IOU_THRESHOLD:
                     best_iou = iou
                     best_det_idx = det_idx
@@ -209,22 +258,36 @@ class LineCrossingDetector:
             if best_det_idx is None:
                 continue
 
-            x1, y1, x2, y2, conf = detections[best_det_idx]
-            cx = (x1 + x2) // 2
-            cy = (y1 + y2) // 2
+            x1_det, y1_det, x2_det, y2_det, conf = detections[best_det_idx]
+            cx = (x1_det + x2_det) // 2
+            cy = (y1_det + y2_det) // 2
 
-            prev_cy = tr.center[1]
+            prev_cx, prev_cy = tr.center
             crossed_now = False
 
             if (not tr.crossed) and (now_ts - tr.last_cross_ts >= TRACK_CROSS_COOLDOWN_S):
-                if self.direction == "down":
-                    if prev_cy < line_y <= cy:
-                        crossed_now = True
-                else:
-                    if prev_cy > line_y >= cy:
-                        crossed_now = True
+                side_prev = (prev_cx - x1) * ly - (prev_cy - y1) * lx
+                side_curr = (cx - x1) * ly - (cy - y1) * lx
 
-            tr.bbox = (x1, y1, x2, y2)
+                t = ((cx - x1) * lx + (cy - y1) * ly) / seg_len_sq
+                if -0.1 <= t <= 1.1:
+                    sign_change = side_prev == 0 or side_curr == 0 or (side_prev * side_curr < 0)
+
+                    mvx = cx - prev_cx
+                    mvy = cy - prev_cy
+                    dir_ok = True
+                    if self.direction == "down":
+                        dir_ok = mvy > 0
+                    elif self.direction == "up":
+                        dir_ok = mvy < 0
+                    elif self.direction == "right":
+                        dir_ok = mvx > 0
+                    elif self.direction == "left":
+                        dir_ok = mvx < 0
+
+                    crossed_now = sign_change and dir_ok
+
+            tr.bbox = (x1_det, y1_det, x2_det, y2_det)
             tr.center = (cx, cy)
             tr.confidence = conf
             tr.age = 0
@@ -461,18 +524,15 @@ class StreamProcessor:
 
         self.use_ffmpeg_direct = USE_FFMPEG_DIRECT
 
-        plate_y = _get_env_float("PLATE_LINE_Y_POSITION", "LINE_Y_POSITION", 0.6)
-        plate_dir = _get_env_str("PLATE_LINE_DIRECTION", "LINE_DIRECTION", "down")
+        pl_x1, pl_y1, pl_x2, pl_y2, pl_dir = _get_line_from_env("PLATE", PLATE_LINE_Y1)
+        sn_x1, sn_y1, sn_x2, sn_y2, sn_dir = _get_line_from_env("SNOW", SNOW_LINE_Y1)
 
-        snow_y = _get_env_float("SNOW_LINE_Y_POSITION", "LINE_Y_POSITION", 0.6)
-        snow_dir = _get_env_str("SNOW_LINE_DIRECTION", "LINE_DIRECTION", "down")
-
-        self.plate_detector = LineCrossingDetector(plate_y, plate_dir)
-        self.snow_detector  = LineCrossingDetector(snow_y, snow_dir)
+        self.plate_detector = LineCrossingDetector(pl_x1, pl_y1, pl_x2, pl_y2, pl_dir)
+        self.snow_detector  = LineCrossingDetector(sn_x1, sn_y1, sn_x2, sn_y2, sn_dir)
 
         print("[STREAM] Initialized detectors:")
-        print(f"[STREAM]   Plate: Y={plate_y}, direction={plate_dir}")
-        print(f"[STREAM]   Snow:  Y={snow_y}, direction={snow_dir}")
+        print(f"[STREAM]   Plate: ({pl_x1:.3f},{pl_y1:.3f})-({pl_x2:.3f},{pl_y2:.3f}) dir={pl_dir}")
+        print(f"[STREAM]   Snow:  ({sn_x1:.3f},{sn_y1:.3f})-({sn_x2:.3f},{sn_y2:.3f}) dir={sn_dir}")
 
         self.plate_cap: Optional[RTSPHandle] = None
         self.snow_cap: Optional[RTSPHandle] = None
@@ -729,8 +789,15 @@ class StreamProcessor:
         plate = (gemini_result or {}).get("plate")
         plate_conf = float((gemini_result or {}).get("plate_confidence", 0.0) or 0.0)
 
+        # Если номер не распознан — явно ставим строку "None", чтобы не было пустого значения
         if plate:
             plate = str(plate).strip().upper()
+        else:
+            plate = "None"
+            plate_conf = 0.0
+
+        # Дедупликация только для реальных номеров
+        if plate != "None":
             with self._plates_lock:
                 old = [p for p, ts in self._processed_plates.items() if (now_ts - ts) > DEDUP_WINDOW_SECONDS]
                 for p in old:
@@ -742,7 +809,7 @@ class StreamProcessor:
 
                 self._processed_plates[plate] = now_ts
 
-        now_iso = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+        now_iso = _now_local_iso()
 
         event_data = {
             "camera_id": PLATE_CAMERA_ID,
@@ -839,20 +906,13 @@ class StreamProcessor:
                 if dets:
                     crossed = self.snow_detector.process_frame(frame, dets)
                     for tr in crossed:
-                        h, _w = frame.shape[:2]
-                        line_y = int(h * self.snow_detector.line_y_ratio)
-                        cy = tr.center[1]
-                        ok = (self.snow_detector.direction == "down" and cy >= line_y) or (
-                            self.snow_detector.direction == "up" and cy <= line_y
-                        )
-                        if ok:
-                            with self._snow_cross_lock:
-                                self._snow_crossing_frames.append({
-                                    "frame": frame.copy(),
-                                    "timestamp": now_ts,
-                                    "track_id": tr.track_id,
-                                })
-                            print(f"[STREAM] Snow crossing: track_id={tr.track_id}, cy={cy}, line_y={line_y}")
+                        with self._snow_cross_lock:
+                            self._snow_crossing_frames.append({
+                                "frame": frame.copy(),
+                                "timestamp": now_ts,
+                                "track_id": tr.track_id,
+                            })
+                        print(f"[STREAM] Snow crossing: track_id={tr.track_id}, center={tr.center}")
 
             time.sleep(0.005)
 

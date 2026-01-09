@@ -30,11 +30,29 @@ _load_env_vars()
 PLATE_CAMERA_RTSP = os.getenv("PLATE_CAMERA_RTSP", "")
 SNOW_CAMERA_RTSP = os.getenv("SNOW_CAMERA_RTSP", "")
 
-PLATE_LINE_Y_POSITION = float(os.getenv("PLATE_LINE_Y_POSITION", "0.65"))
-SNOW_LINE_Y_POSITION = float(os.getenv("SNOW_LINE_Y_POSITION", "0.82"))
+def _get_line_from_env(prefix: str, default_y: float) -> tuple[float, float, float, float, str]:
+    """
+    Возвращает (x1, y1, x2, y2, direction) в нормированных координатах [0..1].
+    Если заданы только *_Y_POSITION – создаём горизонтальную линию по умолчанию.
+    """
+    dir_val = os.getenv(f"{prefix}_LINE_DIRECTION", "down").strip().lower()
+    # старый формат: только Y
+    y_only = os.getenv(f"{prefix}_LINE_Y_POSITION")
+    if y_only:
+        y = float(y_only)
+        return 0.0, y, 1.0, y, dir_val
+    x1 = float(os.getenv(f"{prefix}_LINE_X1", "0.0"))
+    y1 = float(os.getenv(f"{prefix}_LINE_Y1", f"{default_y:.3f}"))
+    x2 = float(os.getenv(f"{prefix}_LINE_X2", "1.0"))
+    y2 = float(os.getenv(f"{prefix}_LINE_Y2", f"{default_y:.3f}"))
+    return x1, y1, x2, y2, dir_val
 
-PLATE_LINE_DIRECTION = os.getenv("PLATE_LINE_DIRECTION", "down").strip().lower()
-SNOW_LINE_DIRECTION = os.getenv("SNOW_LINE_DIRECTION", "down").strip().lower()
+PLATE_LINE_X1, PLATE_LINE_Y1, PLATE_LINE_X2, PLATE_LINE_Y2, PLATE_LINE_DIRECTION = _get_line_from_env(
+    "PLATE", 0.65
+)
+SNOW_LINE_X1, SNOW_LINE_Y1, SNOW_LINE_X2, SNOW_LINE_Y2, SNOW_LINE_DIRECTION = _get_line_from_env(
+    "SNOW", 0.82
+)
 
 FFMPEG_OUT_W = int(os.getenv("FFMPEG_OUT_W", "1280"))
 FFMPEG_OUT_H = int(os.getenv("FFMPEG_OUT_H", "720"))
@@ -199,15 +217,19 @@ def _detect(yolo, frame: np.ndarray):
     return dets
 
 # --- drawing ---
-def _draw_overlay(frame: np.ndarray, line_ratio: float, direction: str, dets, title: str, fps: float) -> np.ndarray:
+def _draw_overlay(frame: np.ndarray, line_pts: tuple[float, float, float, float], direction: str, dets, title: str, fps: float) -> np.ndarray:
     h, w = frame.shape[:2]
-    line_y = int(h * line_ratio)
+    x1r, y1r, x2r, y2r = line_pts
+    x1 = int(w * x1r)
+    y1 = int(h * y1r)
+    x2 = int(w * x2r)
+    y2 = int(h * y2r)
 
     out = frame.copy()
 
     # линия
-    cv2.line(out, (0, line_y), (w - 1, line_y), (0, 255, 255), 2)
-    cv2.putText(out, f"line_y_ratio={line_ratio:.3f} dir={direction}", (10, 30),
+    cv2.line(out, (x1, y1), (x2, y2), (0, 255, 255), 2)
+    cv2.putText(out, f"line=({x1r:.3f},{y1r:.3f})-({x2r:.3f},{y2r:.3f}) dir={direction}", (10, 30),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
 
     # bbox
@@ -222,18 +244,21 @@ def _draw_overlay(frame: np.ndarray, line_ratio: float, direction: str, dets, ti
     return out
 
 def main():
+    global PLATE_LINE_DIRECTION, SNOW_LINE_DIRECTION
     if not PLATE_CAMERA_RTSP or not SNOW_CAMERA_RTSP:
         print("[PREVIEW] ERROR: PLATE_CAMERA_RTSP / SNOW_CAMERA_RTSP not set in app.env")
         return
 
     print("[PREVIEW] Controls:")
-    print("  Q / ESC  -> quit")
-    print("  1 / 2    -> select Plate(1) or Snow(2) line")
-    print("  W / S    -> move selected line up/down (small step)")
-    print("  E / D    -> move selected line up/down (big step)")
-    print("  R        -> reload app.env (ratios)")
+    print("  Q / ESC      -> quit")
+    print("  1 / 2        -> select Plate(1) or Snow(2) line")
+    print("  TAB / C      -> switch line point A <-> B")
+    print("  W/A/S/D      -> move selected point (small step)")
+    print("  I/J/K/L      -> move selected point (big step)")
+    print("  R            -> reload app.env (line coords + direction)")
     print("")
-    print(f"[PREVIEW] Plate ratio={PLATE_LINE_Y_POSITION:.3f}, Snow ratio={SNOW_LINE_Y_POSITION:.3f}")
+    print(f"[PREVIEW] Plate line=({PLATE_LINE_X1:.3f},{PLATE_LINE_Y1:.3f})-({PLATE_LINE_X2:.3f},{PLATE_LINE_Y2:.3f}) dir={PLATE_LINE_DIRECTION}")
+    print(f"[PREVIEW] Snow  line=({SNOW_LINE_X1:.3f},{SNOW_LINE_Y1:.3f})-({SNOW_LINE_X2:.3f},{SNOW_LINE_Y2:.3f}) dir={SNOW_LINE_DIRECTION}")
 
     yolo = _load_yolo()
 
@@ -245,8 +270,10 @@ def main():
         return
 
     sel = 1  # 1=plate, 2=snow
-    plate_ratio = PLATE_LINE_Y_POSITION
-    snow_ratio = SNOW_LINE_Y_POSITION
+    plate_pts = [PLATE_LINE_X1, PLATE_LINE_Y1, PLATE_LINE_X2, PLATE_LINE_Y2]
+    snow_pts = [SNOW_LINE_X1, SNOW_LINE_Y1, SNOW_LINE_X2, SNOW_LINE_Y2]
+
+    point_sel = 0  # 0 = A (x1,y1), 1 = B (x2,y2)
 
     last_t = time.time()
     fps = 0.0
@@ -274,8 +301,8 @@ def main():
                 fc = 0
                 last_t = now
 
-            vis1 = _draw_overlay(f1, plate_ratio, PLATE_LINE_DIRECTION, dets1, "PLATE (press 1)", fps)
-            vis2 = _draw_overlay(f2, snow_ratio, SNOW_LINE_DIRECTION, dets2, "SNOW  (press 2)", fps)
+            vis1 = _draw_overlay(f1, tuple(plate_pts), PLATE_LINE_DIRECTION, dets1, "PLATE (press 1)", fps)
+            vis2 = _draw_overlay(f2, tuple(snow_pts), SNOW_LINE_DIRECTION, dets2, "SNOW  (press 2)", fps)
 
             # подпись какая линия выбрана
             if sel == 1:
@@ -294,42 +321,70 @@ def main():
             if key == ord("2"):
                 sel = 2
 
+            # выбор точки
+            if key in (9, ord("c")):  # Tab или C
+                point_sel = 1 - point_sel
+
             # steps
             small = 0.005
             big = 0.02
 
-            if key == ord("w"):
-                if sel == 1: plate_ratio = max(0.05, plate_ratio - small)
-                else: snow_ratio = max(0.05, snow_ratio - small)
-            if key == ord("s"):
-                if sel == 1: plate_ratio = min(0.95, plate_ratio + small)
-                else: snow_ratio = min(0.95, snow_ratio + small)
+            def _move(target_pts, dx, dy):
+                idx = 0 if point_sel == 0 else 2
+                target_pts[idx] = min(1.0, max(0.0, target_pts[idx] + dx))
+                target_pts[idx + 1] = min(1.0, max(0.0, target_pts[idx + 1] + dy))
 
-            if key == ord("e"):
-                if sel == 1: plate_ratio = max(0.05, plate_ratio - big)
-                else: snow_ratio = max(0.05, snow_ratio - big)
-            if key == ord("d"):
-                if sel == 1: plate_ratio = min(0.95, plate_ratio + big)
-                else: snow_ratio = min(0.95, snow_ratio + big)
+            if key == ord("w"):  # small up
+                _move(plate_pts if sel == 1 else snow_pts, 0.0, -small)
+            if key == ord("s"):  # small down
+                _move(plate_pts if sel == 1 else snow_pts, 0.0, small)
+            if key == ord("a"):  # small left
+                _move(plate_pts if sel == 1 else snow_pts, -small, 0.0)
+            if key == ord("d"):  # small right
+                _move(plate_pts if sel == 1 else snow_pts, small, 0.0)
+
+            if key == ord("i"):  # big up
+                _move(plate_pts if sel == 1 else snow_pts, 0.0, -big)
+            if key == ord("k"):  # big down
+                _move(plate_pts if sel == 1 else snow_pts, 0.0, big)
+            if key == ord("j"):  # big left
+                _move(plate_pts if sel == 1 else snow_pts, -big, 0.0)
+            if key == ord("l"):  # big right
+                _move(plate_pts if sel == 1 else snow_pts, big, 0.0)
 
             if key == ord("r"):
                 _load_env_vars()
-                plate_ratio = float(os.getenv("PLATE_LINE_Y_POSITION", f"{plate_ratio:.3f}"))
-                snow_ratio = float(os.getenv("SNOW_LINE_Y_POSITION", f"{snow_ratio:.3f}"))
-                print(f"[PREVIEW] Reloaded env: Plate={plate_ratio:.3f}, Snow={snow_ratio:.3f}")
+                pl_x1, pl_y1, pl_x2, pl_y2, pl_dir = _get_line_from_env("PLATE", plate_pts[1])
+                sn_x1, sn_y1, sn_x2, sn_y2, sn_dir = _get_line_from_env("SNOW", snow_pts[1])
+                plate_pts = [pl_x1, pl_y1, pl_x2, pl_y2]
+                snow_pts = [sn_x1, sn_y1, sn_x2, sn_y2]
+                PLATE_LINE_DIRECTION = pl_dir  # type: ignore[misc]
+                SNOW_LINE_DIRECTION = sn_dir    # type: ignore[misc]
+                print(f"[PREVIEW] Reloaded env:")
+                print(f"         Plate=({plate_pts[0]:.3f},{plate_pts[1]:.3f})-({plate_pts[2]:.3f},{plate_pts[3]:.3f}) dir={PLATE_LINE_DIRECTION}")
+                print(f"         Snow =({snow_pts[0]:.3f},{snow_pts[1]:.3f})-({snow_pts[2]:.3f},{snow_pts[3]:.3f}) dir={SNOW_LINE_DIRECTION}")
 
             # печать текущих
-            if key in (ord("w"), ord("s"), ord("e"), ord("d")):
-                print(f"[PREVIEW] Plate={plate_ratio:.3f} | Snow={snow_ratio:.3f}")
+            if key in (ord("w"), ord("s"), ord("a"), ord("d"), ord("i"), ord("k"), ord("j"), ord("l")):
+                print(f"[PREVIEW] Plate=({plate_pts[0]:.3f},{plate_pts[1]:.3f})-({plate_pts[2]:.3f},{plate_pts[3]:.3f}) | "
+                      f"Snow=({snow_pts[0]:.3f},{snow_pts[1]:.3f})-({snow_pts[2]:.3f},{snow_pts[3]:.3f}) | point={'A' if point_sel==0 else 'B'}")
 
     finally:
         plate.stop()
         snow.stop()
         cv2.destroyAllWindows()
 
-        print("\n[PREVIEW] Final ratios you should put into app.env:")
-        print(f"PLATE_LINE_Y_POSITION={plate_ratio:.3f}")
-        print(f"SNOW_LINE_Y_POSITION={snow_ratio:.3f}")
+        print("\n[PREVIEW] Final values you should put into app.env:")
+        print(f"PLATE_LINE_X1={plate_pts[0]:.3f}")
+        print(f"PLATE_LINE_Y1={plate_pts[1]:.3f}")
+        print(f"PLATE_LINE_X2={plate_pts[2]:.3f}")
+        print(f"PLATE_LINE_Y2={plate_pts[3]:.3f}")
+        print(f"PLATE_LINE_DIRECTION={PLATE_LINE_DIRECTION}")
+        print(f"SNOW_LINE_X1={snow_pts[0]:.3f}")
+        print(f"SNOW_LINE_Y1={snow_pts[1]:.3f}")
+        print(f"SNOW_LINE_X2={snow_pts[2]:.3f}")
+        print(f"SNOW_LINE_Y2={snow_pts[3]:.3f}")
+        print(f"SNOW_LINE_DIRECTION={SNOW_LINE_DIRECTION}")
 
 if __name__ == "__main__":
     main()

@@ -36,8 +36,8 @@ SNOW_LINE_Y_POSITION = float(os.getenv("SNOW_LINE_Y_POSITION", "0.82"))
 PLATE_LINE_DIRECTION = os.getenv("PLATE_LINE_DIRECTION", "down").strip().lower()
 SNOW_LINE_DIRECTION = os.getenv("SNOW_LINE_DIRECTION", "down").strip().lower()
 
-FFMPEG_OUT_W = int(os.getenv("FFMPEG_OUT_W", "456"))
-FFMPEG_OUT_H = int(os.getenv("FFMPEG_OUT_H", "240"))
+FFMPEG_OUT_W = int(os.getenv("FFMPEG_OUT_W", "1280"))
+FFMPEG_OUT_H = int(os.getenv("FFMPEG_OUT_H", "720"))
 
 YOLO_MODEL_PATH = os.getenv("YOLO_MODEL_PATH", "yolov8n.pt")
 MIN_CONFIDENCE = float(os.getenv("STREAM_MIN_CONFIDENCE", "0.50"))

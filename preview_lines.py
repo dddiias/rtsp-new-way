@@ -17,7 +17,7 @@ def _load_env_vars() -> None:
         from dotenv import load_dotenv
         env_path = os.path.join(os.path.dirname(__file__), "app.env")
         if os.path.exists(env_path):
-            load_dotenv(env_path, override=True)
+            load_dotenv(env_path, override=False)
             print(f"[PREVIEW] Loaded environment from: {env_path}")
         else:
             print(f"[PREVIEW] WARNING: app.env not found at {env_path}, using system env vars")
